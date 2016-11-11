@@ -37,6 +37,7 @@ import sys
 import sqlite3
 
 from optparse import OptionParser, OptionGroup
+from subprocess import call
 
 def setupOptions():
     usage = 'usage: %prog [options]'
@@ -167,6 +168,9 @@ def loadAuthorMap(opt):
     return authmap
 
 def _processFilename(opts, name):
+    # Get rid of 'magic' characters from potential filename - replace with '_'
+    # Magic: [ \:*?"'<>| ]
+    name = re.sub(r'[\\\:\*\?"\'<>\| ]', '_', name)
     if (string.find(name, '/') > -1):
         logging.debug('DIR FOUND [%s]' % name)
         # Treat as dir/dir/dir/basename
@@ -181,18 +185,39 @@ def _processFilename(opts, name):
         return '%s/%s' % (opts.git_root_dir, name)
 
 def processWiki(opts, authors):
+    os.chdir(opts.git_root_dir)
     logging.info('Processing the wiki...')
     conn = sqlite3.connect(opts.trac_export)
+
+    # For every version of every file in the wiki...
     for row in conn.execute("select name, version, author, comment, datetime(time/1000000, 'unixepoch'), text from wiki order by name, version"):
-        fname = _processFilename(opts, row[0])
+        tracname = row[0]
+        tracvers = row[1]
+        tracauth = row[2]
+        comment  = row[3] if row[3] else 'Initial load of version %s of trac-file %s' % (tracvers, tracname)
+        tracdate = row[4]
+        contents = row[5]
+
+        fname = _processFilename(opts, tracname)
         logging.debug('...working with file [%s]' % fname)
-        f = open(fname, 'w')
-        f.truncate()
-        f.write(row[5].encode('utf-8'))
-        f.close()
-        #print 'git add %s' % fname
-        #print 'git commit -m "%s" --author "%s" --date "%s"' % (row[3], authors.get(row[2]), row[4])
-        #print 'erase file %s' % fname
+        # Create file with content
+        with open(fname, 'w') as f:
+            f.truncate()
+            f.write(contents.encode('utf-8'))
+
+        # git-add it
+        if (call(['git', 'add', fname])):
+            logging.error('ERROR at git-add %s!!!' % fname)
+            sys.exit(1)
+
+        # git-commit it
+        if (call(['git', 'commit',
+            '-m', ('"%s"' % comment),
+            '--author', ('"%s <%s>"' % (tracauth, authors.get(tracauth))),
+            '--date', ('"%s"' % tracdate)])):
+            logging.error('ERROR at git-commit %s!!!' % fname)
+            sys.exit(1)
+
     return 0
 
 def cleanup(opt):
