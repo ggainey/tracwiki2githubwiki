@@ -198,6 +198,10 @@ def processWiki(opts, authors):
         tracdate = row[4]
         contents = row[5]
 
+        # skip anything whose name begins with Trac or Wiki
+        if (tracname.startswith('Trac') or tracname.startswith('Wiki')):
+            continue
+
         fname = _processFilename(opts, tracname)
         logging.debug('...working with file [%s]' % fname)
         # Create file with content
