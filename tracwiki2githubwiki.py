@@ -23,8 +23,8 @@
 #
 
 """
-trac2github - a tool for transforming a Trac wiki, as contained in an exported sqlite3
-database, into a github-wiki git repository
+tracwiki2githubwiki - a tool for transforming a Trac wiki, as contained in an exported
+sqlite3 database, into a github-wiki git repository
 """
 
 import csv
