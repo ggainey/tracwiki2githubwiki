@@ -9,3 +9,5 @@ This tool exists to migrate a Trac wiki to a git repository, preserving history 
   * Leave directories with their actual names, files with same name as directory become index-file in that directory?
  * manpage
  * specfile
+ * make everything more Python-y
+ * Py3?
