@@ -188,26 +188,22 @@ def processWiki(opts, authors):
     os.chdir(opts.git_root_dir)
     logging.info('Processing the wiki...')
     conn = sqlite3.connect(opts.trac_export)
+    conn.row_factory = sqlite3.Row
 
     # For every version of every file in the wiki...
-    for row in conn.execute("select name, version, author, comment, datetime(time/1000000, 'unixepoch'), text from wiki order by name, version"):
-        tracname = row[0]
-        tracvers = row[1]
-        tracauth = row[2]
-        comment  = row[3] if row[3] else 'Initial load of version %s of trac-file %s' % (tracvers, tracname)
-        tracdate = row[4]
-        contents = row[5]
+    for row in conn.execute("select name, version, author, comment, datetime(time/1000000, 'unixepoch') fixeddate, text from wiki order by name, version"):
+        comment  = row['comment'] if row['comment'] else 'Initial load of version %s of trac-file %s' % (row['version'], row['name'])
 
         # skip anything whose name begins with Trac or Wiki
-        if (tracname.startswith('Trac') or tracname.startswith('Wiki')):
+        if (row['name'].startswith('Trac') or row['name'].startswith('Wiki')):
             continue
 
-        fname = _processFilename(opts, tracname)
+        fname = _processFilename(opts, row['name'])
         logging.debug('...working with file [%s]' % fname)
         # Create file with content
         with open(fname, 'w') as f:
             f.truncate()
-            f.write(contents.encode('utf-8'))
+            f.write(row['text'].encode('utf-8'))
 
         # git-add it
         if (call(['git', 'add', fname])):
@@ -217,11 +213,17 @@ def processWiki(opts, authors):
         # git-commit it
         if (call(['git', 'commit',
             '-m', ('"%s"' % comment),
-            '--author', ('"%s <%s>"' % (tracauth, authors.get(tracauth))),
-            '--date', ('"%s"' % tracdate)])):
+            '--author', ('"%s <%s>"' % (row['author'], authors.get(row['author']))),
+            '--date', ('"%s"' % row['fixeddate'])])):
             logging.error('ERROR at git-commit %s!!!' % fname)
             sys.exit(1)
 
+    return 0
+
+def processAttachments(opts, authors):
+    return 0
+
+def toMarkdown(options):
     return 0
 
 def cleanup(opt):
@@ -242,4 +244,4 @@ if __name__ == '__main__':
 
     authMap = loadAuthorMap(options)
     processWiki(options, authMap)
-
+    processAttachments(options, authMap)
