@@ -49,6 +49,7 @@ MAXVERSION_SQL = '''
 select name, version, text
   from wiki w
  where version = (select max(version) from wiki where name = w.name)
+ order by name
 '''
 
 GETAUTHOR_SQL = '''
@@ -59,6 +60,10 @@ select distinct author
 
 MOVE_COMMENT    = "Renaming all files to have .md extension"
 CONVERT_COMMENT = "Converted to Markdown by tracwiki2githubwiki"
+
+# Map of <tracname>: fsname - used in many places
+allfiles = {}
+alldirs = set()
 
 def setupOptions():
     usage = 'usage: %prog [options]'
@@ -175,9 +180,14 @@ def loadAuthorMap(opt):
         conn.close()
     else:
         logging.info('...generating from specified map-file')
-        amf = open(opt.author_map, mode='r')
-        csvr = csv.reader(amf)
-        authmap = {row[0]:row[1] for row in csvr}
+        # Load authmap from CSV
+        with open(opt.author_map, mode='r') as amf:
+            csvr = csv.reader(amf)
+            authmap = {row[0]:row[1] for row in csvr}
+        # Fill in any missing authors
+        for k in authmap.keys():
+            if (not authmap[k]):
+                authmap[k] = '%s@%s' % (k, opt.default_host)
 
     #import pprint
     #logging.debug('...returning map [%s]' % pprint.pformat(authmap))
@@ -203,7 +213,7 @@ def _processFilename(opts, name, dirs):
         name = name + '/Index'
 
     if (string.find(name, '/') > -1):
-        logging.debug('DIR FOUND [%s]' % name)
+        #logging.debug('DIR FOUND [%s]' % name)
         # Treat as dir/dir/dir/basename
         d = opts.git_root_dir + '/' + os.path.dirname(name)
         f = os.path.basename(name)
@@ -227,9 +237,8 @@ def _connect(opt):
     return conn
 
 def createFilenameMapping(opt):
-    logging.info('Creating filename-mapping...')
     alldirs = set()
-    allfiles = {}
+    logging.info('Creating filename-mapping...')
     conn = _connect(opt)
 
     # First find all directories
@@ -245,14 +254,13 @@ def createFilenameMapping(opt):
     # Now, create a dict of (tracname: possibly-renamed-but-definitely-fqdn)
     for row in conn.execute(MAXVERSION_SQL):
         name = _processFilename(opt, row['name'], alldirs)
-        allfiles[row['name']] = name
+        allfiles[_cleanseFilename(row['name'])] = name
 
     conn.close()
 
-    logging.debug('...returning dict [%s]' % pprint.pformat(allfiles))
-    return allfiles
+    logging.debug('...created dict [%s]' % pprint.pformat(allfiles))
 
-def processWiki(opts, authors, allfiles):
+def processWiki(opts, authors):
     logging.info('Processing the wiki...')
     os.chdir(opts.git_root_dir)
     conn = _connect(opts)
@@ -264,9 +272,9 @@ def processWiki(opts, authors, allfiles):
 
         comment  = row['comment'] if row['comment'] else 'Initial load of version %s of trac-file %s' % (row['version'], row['name'])
 
-        fname = allfiles[row['name']]
+        fname = allfiles[_cleanseFilename(row['name'])]
         logging.debug('...working with file [%s]' % fname)
-        logging.debug('tracname|fname : %s|%s' % (row['name'], fname))
+        #logging.debug('tracname|fname : %s|%s' % (row['name'], fname))
 
         # Create file with content
         with open(fname, 'w') as f:
@@ -281,13 +289,57 @@ def processWiki(opts, authors, allfiles):
         # git-commit it
         if (call(['git', 'commit',
             '-m', ('"%s"' % comment),
-            '--author', ('"%s <%s>"' % (row['author'], authors.get(row['author']))),
+            '--author', ('"%s <%s>"' % (row['author'].encode('utf-8'), authors.get(row['author']))),
             '--date', ('"%s"' % row['fixeddate'])])):
             logging.error('ERROR at git-commit %s!!!' % fname)
             sys.exit(1)
 
     conn.close()
     return 0
+
+def _convert_wiki_link(link):
+    """
+    <tracname>
+    <tracname>#anchor
+    wiki:<tracname> or just <tracname>
+    wiki:<tracname>#anchor
+    """
+    logging.debug('..._convert_wiki_link [' + link + ']')
+    # drop leading wiki:
+    if link.startswith('wiki:'):
+        link = link[5:]
+    # find and drop any anchors
+    lasthash = string.rfind(link, '#')
+    if (lasthash > -1):
+        link = link[:lasthash]
+    # Cleanse the result
+    link = _cleanseFilename(link)
+
+    # See if what's left might now be recognized as a directory
+    if (os.path.basename(link) in alldirs):
+        link += '/Index'
+
+    # Final result might *still* not be in allfiles (because broken links are a thing...)
+    if (link in allfiles):
+        return allfiles[link] + '.md'
+    else:
+        return link + '.md'
+
+def sub_full_wiki_link(m):
+    return '[%s](%s)' % (m.group(2), _convert_wiki_link(m.group(1)))
+
+def sub_simple_wiki_link(m):
+    return '[[%s]]' % _convert_wiki_link(m.group(1))
+
+def sub_table(m):
+    import pprint
+    logging.debug('..._sub_table [%s]' % pprint.pformat(m))
+    lines = []
+    for group in m.group(0).strip().split('\n'):
+        lines.append(' | '.join(group.strip().split('||')).strip())
+        width = len(m.group(1).strip().split('||')) - 2
+        lines.insert(1, '| %s |' % ' | '.join('---' for x in range(width)))
+    return '\n%s\n' % '\n'.join(lines)
 
 def _convert(text):
     """
@@ -303,43 +355,59 @@ def _convert(text):
         return '\n    ' + m.group(1).replace('\n', '\n    ')
     # Fix code-format-block
     text = re.sub(r'(?sm){{{\n(.*?)\n}}}', indent4, text)
-
+    # Fix tables
+    text = re.sub(r'(?m)^(\|\|[^\n]+\|\| *\n?)+$', sub_table, text)
+    # Fix [[TOC]]
+    text = re.sub(r'\[\[TOC.*\]\]', r'<!--[[TOC]]-->', text)
+    # Fix [[PageOutline]]
+    text = re.sub(r'\[\[PageOutline\]\]', r'<!--[[PageOutline]]-->', text)
     # Fix Header-4
-    text = re.sub(r'(?m)^====\s+(.*?)\s+====$', r'#### \1', text)
+    text = re.sub(r'(?m)^====\s+(.*?)\s+====\s*$', r'#### \1', text)
     # Fix Header-3
-    text = re.sub(r'(?m)^===\s+(.*?)\s+===$', r'### \1', text)
+    text = re.sub(r'(?m)^===\s+(.*?)\s+===\s*$', r'### \1', text)
     # Fix Header-2
-    text = re.sub(r'(?m)^==\s+(.*?)\s+==$', r'## \1', text)
+    text = re.sub(r'(?m)^==\s+(.*?)\s+==\s*$', r'## \1', text)
     # Fix Header-1
-    text = re.sub(r'(?m)^=\s+(.*?)\s+=$', r'# \1', text)
+    text = re.sub(r'(?m)^=\s+(.*?)\s+=\s*$', r'# \1', text)
     # Fix 4th-level-bullet-lists
+    text = re.sub(r'^        * ', r'****', text)
     text = re.sub(r'^       * ', r'****', text)
     # Fix 3rd-level-bullet-lists
+    text = re.sub(r'^      * ', r'***', text)
     text = re.sub(r'^     * ', r'***', text)
     # Fix 2nd-level-bullet-lists
+    text = re.sub(r'^    * ', r'**', text)
     text = re.sub(r'^   * ', r'**', text)
     # Fix bullet-lists
+    text = re.sub(r'^  * ', r'*', text)
     text = re.sub(r'^ * ', r'*', text)
     # Fix numbered lists
     text = re.sub(r'^ \d+. ', r'1.', text)
+    # Fix hard-BR
+    text = re.sub(r'(?m)\[\[BR\]\]$', '  ', text)
     a = []
     for line in text.split('\n'):
-        if not line.startswith('    '):
-            # Fix external hyperlinks
-            line = re.sub(r'\[(https?://[^\s\[\]]+)\s([^\[\]]+)\]', r'[\2](\1)', line)
-            # Fix internal wiki-links
-            line = re.sub(r'\[(wiki:)([^\s\[\]]+)\s([^\[\]]+)\]', r'[\3](\2.md)', line)
-            # Fix "don't auto-trac-link-this" links
-            line = re.sub(r'\!(([A-Z][a-z0-9]+){2,})', r'\1', line)
-            # Fix bold
-            line = re.sub(r'\'\'\'(.*?)\'\'\'', r'*\1*', line)
-            # Fix italics
-            line = re.sub(r'\'\'(.*?)\'\'', r'_\1_', line)
+        # Fix external hyperlinks
+        line = re.sub(r'\[(https?://[^\s\[\]]+)\s([^\[\]]+)\]', r'[\2](\1)', line)
+        # Fix simple-internal-wiki-links (?)
+        line = re.sub(r'(?<!\[)\[([^\s\[\]]+?)\]', sub_simple_wiki_link, line)
+        # Fix wiki-links that don't start with wiki: (?!?)
+        line = re.sub(r'\[([^\s\[\]]+)\s([^\[\]]+)\]', sub_full_wiki_link, line)
+        # Fix complex-internal-wiki-links
+        line = re.sub(r'\[wiki:([^\s\[\]\"]+)\s([^\[\]]+)\]', sub_full_wiki_link, line)
+        # Fix complex-internal-wiki-links WITH QUOTES
+        line = re.sub(r'\[wiki:"([^\[\]]+)"\s([^\[\]]+)\]', sub_full_wiki_link, line)
+        # Fix "don't auto-trac-link-this" links
+        line = re.sub(r'\!(([A-Z][a-z0-9]+){2,})', r'\1', line)
+        # Fix bold
+        line = re.sub(r'\'\'\'(.*?)\'\'\'', r'*\1*', line)
+        # Fix italics
+        line = re.sub(r'\'\'(.*?)\'\'', r'_\1_', line)
         a.append(line)
     text = '\n'.join(a)
     return text
 
-def toMarkdown(opts, allfiles):
+def toMarkdown(opts):
     """
     Convert Trac-markup in most-recent version of files, to Markdown markup
     We're going to do ONE commit that renames All The Tings to *.md
@@ -355,7 +423,7 @@ def toMarkdown(opts, allfiles):
         if (_skipFile(row['name'])):
             continue
 
-        fname = allfiles[row['name']]
+        fname = allfiles[_cleanseFilename(row['name'])]
         fname_md = fname + '.md'
 
         # git-mv the file to give it the .md extension
@@ -378,7 +446,7 @@ def toMarkdown(opts, allfiles):
         # Get converted content
         content = _convert(row['text'])
 
-        fname = allfiles[row['name']]
+        fname = allfiles[_cleanseFilename(row['name'])]
         fname_md = fname + '.md'
 
         # Write the new contents
@@ -401,7 +469,7 @@ def toMarkdown(opts, allfiles):
     conn.close()
     return 0
 
-def processAttachments(opts, authors, alldirs):
+def processAttachments(opts, authors):
     return 0
 
 def cleanup(opt):
@@ -421,7 +489,7 @@ if __name__ == '__main__':
         sys.exit(0)
 
     authMap = loadAuthorMap(options)
-    fileMap = createFilenameMapping(options)
-    processWiki(options, authMap, fileMap)
-    toMarkdown(options, fileMap)
-    processAttachments(options, authMap, fileMap)
+    createFilenameMapping(options)
+    processWiki(options, authMap)
+    toMarkdown(options)
+    processAttachments(options, authMap)
