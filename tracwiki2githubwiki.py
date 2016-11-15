@@ -39,6 +39,27 @@ import sqlite3
 from optparse import OptionParser, OptionGroup
 from subprocess import call
 
+ALLVERSIONS_SQL = '''
+select name, version, author, comment, datetime(time/1000000, 'unixepoch') fixeddate, text
+  from wiki
+ order by name, version
+'''
+
+MAXVERSION_SQL = '''
+select name, version, text
+  from wiki w
+ where version = (select max(version) from wiki where name = w.name)
+'''
+
+GETAUTHOR_SQL = '''
+select distinct author
+  from wiki
+ order by author
+'''
+
+MOVE_COMMENT    = "Renaming all files to have .md extension"
+CONVERT_COMMENT = "Converted to Markdown by tracwiki2githubwiki"
+
 def setupOptions():
     usage = 'usage: %prog [options]'
     parser = OptionParser(usage=usage)
@@ -143,7 +164,7 @@ def generateTracAuthors(opt):
     logging.info('Extracting Trac authors...')
 
     conn = sqlite3.connect(opt.trac_export)
-    for row in conn.execute('SELECT DISTINCT author FROM wiki ORDER BY author'):
+    for row in conn.execute(GETAUTHOR_SQL):
         print row[0]
     conn.close()
 
@@ -156,7 +177,8 @@ def loadAuthorMap(opt):
     if (opt.author_map is None):
         logging.info('...no map specified, generating from DB')
         conn = sqlite3.connect(opt.trac_export)
-        authmap = {row[0]:'%s@%s' % (row[0], opt.default_host) for row in conn.execute('SELECT DISTINCT author FROM wiki ORDER BY author')}
+        authmap = {row[0]:'%s@%s' % (row[0], opt.default_host) for row in conn.execute(GETAUTHOR_SQL)}
+        conn.close()
     else:
         logging.info('...generating from specified map-file')
         amf = open(opt.author_map, mode='r')
@@ -184,6 +206,9 @@ def _processFilename(opts, name):
     else:
         return '%s/%s' % (opts.git_root_dir, name)
 
+def _skipFile(fname):
+    return (fname.startswith('Trac') or (fname.startswith('Wiki') and not fname.startswith('WikiStart')))
+
 def processWiki(opts, authors):
     os.chdir(opts.git_root_dir)
     logging.info('Processing the wiki...')
@@ -191,11 +216,10 @@ def processWiki(opts, authors):
     conn.row_factory = sqlite3.Row
 
     # For every version of every file in the wiki...
-    for row in conn.execute("select name, version, author, comment, datetime(time/1000000, 'unixepoch') fixeddate, text from wiki order by name, version"):
+    for row in conn.execute(ALLVERSIONS_SQL):
         comment  = row['comment'] if row['comment'] else 'Initial load of version %s of trac-file %s' % (row['version'], row['name'])
 
-        # skip anything whose name begins with Trac or Wiki
-        if (row['name'].startswith('Trac') or row['name'].startswith('Wiki')):
+        if (_skipFile(row['name'])):
             continue
 
         fname = _processFilename(opts, row['name'])
@@ -218,12 +242,125 @@ def processWiki(opts, authors):
             logging.error('ERROR at git-commit %s!!!' % fname)
             sys.exit(1)
 
+    conn.close()
+    return 0
+
+def _convert(text):
+    """
+    Conversion rules taken from https://gist.github.com/sgk/1286682, as modified by several
+    other clones thereof
+    """
+    # Fix 'Windows EOL' to 'Linux EOL'
+    text = re.sub('\r\n', '\n', text)
+    # Fix code-format-inline
+    text = re.sub(r'{{{(.*?)}}}', r'`\1`', text)
+
+    def indent4(m):
+        return '\n    ' + m.group(1).replace('\n', '\n    ')
+    # Fix code-format-block
+    text = re.sub(r'(?sm){{{\n(.*?)\n}}}', indent4, text)
+
+    # Fix Header-4
+    text = re.sub(r'(?m)^====\s+(.*?)\s+====$', r'#### \1', text)
+    # Fix Header-3
+    text = re.sub(r'(?m)^===\s+(.*?)\s+===$', r'### \1', text)
+    # Fix Header-2
+    text = re.sub(r'(?m)^==\s+(.*?)\s+==$', r'## \1', text)
+    # Fix Header-1
+    text = re.sub(r'(?m)^=\s+(.*?)\s+=$', r'# \1', text)
+    # Fix 4th-level-bullet-lists
+    text = re.sub(r'^       * ', r'****', text)
+    # Fix 3rd-level-bullet-lists
+    text = re.sub(r'^     * ', r'***', text)
+    # Fix 2nd-level-bullet-lists
+    text = re.sub(r'^   * ', r'**', text)
+    # Fix bullet-lists
+    text = re.sub(r'^ * ', r'*', text)
+    # Fix numbered lists
+    text = re.sub(r'^ \d+. ', r'1.', text)
+    a = []
+    for line in text.split('\n'):
+        if not line.startswith('    '):
+            # Fix external hyperlinks
+            line = re.sub(r'\[(https?://[^\s\[\]]+)\s([^\[\]]+)\]', r'[\2](\1)', line)
+            # Fix internal wiki-links
+            line = re.sub(r'\[(wiki:)([^\s\[\]]+)\s([^\[\]]+)\]', r'[\3](\2.md)', line)
+            # Fix "don't auto-trac-link-this" links
+            line = re.sub(r'\!(([A-Z][a-z0-9]+){2,})', r'\1', line)
+            # Fix bold
+            line = re.sub(r'\'\'\'(.*?)\'\'\'', r'*\1*', line)
+            # Fix italics
+            line = re.sub(r'\'\'(.*?)\'\'', r'_\1_', line)
+        a.append(line)
+    text = '\n'.join(a)
+    return text
+
+def toMarkdown(opts):
+    """
+    Convert Trac-markup in most-recent version of files, to Markdown markup
+    """
+    logging.info('Converting to markdown...')
+    conn = sqlite3.connect(opts.trac_export)
+    conn.row_factory = sqlite3.Row
+    os.chdir(opts.git_root_dir)
+
+    #
+    # We're going to do ONE commit that renames ALl The THings to *.md
+    # Then we convert, then do ONE COMMIT that commits all the markup-conversion changes
+    #
+
+    # For every every file in the wiki, get the max-version, rename to *.md
+    for row in conn.execute(MAXVERSION_SQL):
+        if (_skipFile(row['name'])):
+            continue
+
+        fname = _processFilename(opts, row['name'])
+        fname_md = fname + '.md'
+
+        # git-mv the file to give it the .md extension
+        rc = call(['git', 'mv', fname, fname_md])
+        if (rc):
+            logging.error('ERROR [%d] at git-mv %s!!!' % (rc, fname))
+            continue
+
+    # git-commit ALL THE THINGS
+    rc = call(['git', 'commit', '-m', ('%s' % MOVE_COMMENT)])
+    if (rc):
+        logging.error('ERROR [%d] at MOVE git-commit!!!' % rc)
+
+    # For every every file in the wiki, get the max-version, convert that text to
+    # markdown, and save it as a new version of that file
+    for row in conn.execute(MAXVERSION_SQL):
+        if (_skipFile(row['name'])):
+            continue
+
+        # Get converted content
+        content = _convert(row['text'])
+
+        fname = _processFilename(opts, row['name'])
+        fname_md = fname + '.md'
+
+        # Write the new contents
+        logging.debug('...working with file [%s]' % fname_md)
+        with open(fname_md, 'w') as f:
+            f.truncate()
+            f.write(content.encode('utf-8'))
+
+        # git-add the new contents
+        rc = call(['git', 'add', fname_md])
+        if (rc):
+            logging.error('ERROR [%d] at git-add %s!!!' % (rc, fname_md))
+            continue
+
+    # git-commit ALL THE THINGS
+    rc = call(['git', 'commit', '-m', ('%s' % CONVERT_COMMENT)])
+    if (rc):
+        logging.error('ERROR [%d] at git-commit %s!!!' % (rc, fname))
+
+    conn.close()
     return 0
 
 def processAttachments(opts, authors):
-    return 0
-
-def toMarkdown(options):
     return 0
 
 def cleanup(opt):
@@ -244,4 +381,5 @@ if __name__ == '__main__':
 
     authMap = loadAuthorMap(options)
     processWiki(options, authMap)
+    toMarkdown(options)
     processAttachments(options, authMap)
