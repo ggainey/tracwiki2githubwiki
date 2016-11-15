@@ -154,18 +154,12 @@ def verifyLocations(opt):
 
     return 0
 
-def _dict_factory(cursor, row):
-    d = {}
-    for idx, col in enumerate(cursor.description):
-        d[col[0]] = row[idx]
-    return d
-
 def generateTracAuthors(opt):
     logging.info('Extracting Trac authors...')
 
-    conn = sqlite3.connect(opt.trac_export)
+    conn = _connect(opt)
     for row in conn.execute(GETAUTHOR_SQL):
-        print row[0]
+        print row['author']
     conn.close()
 
     return 0
@@ -176,8 +170,8 @@ def loadAuthorMap(opt):
 
     if (opt.author_map is None):
         logging.info('...no map specified, generating from DB')
-        conn = sqlite3.connect(opt.trac_export)
-        authmap = {row[0]:'%s@%s' % (row[0], opt.default_host) for row in conn.execute(GETAUTHOR_SQL)}
+        conn = _connect(opt)
+        authmap = {row['author']:'%s@%s' % (row['author'], opt.default_host) for row in conn.execute(GETAUTHOR_SQL)}
         conn.close()
     else:
         logging.info('...generating from specified map-file')
@@ -189,17 +183,35 @@ def loadAuthorMap(opt):
     #logging.debug('...returning map [%s]' % pprint.pformat(authmap))
     return authmap
 
-def _processFilename(opts, name):
-    # Get rid of 'magic' characters from potential filename - replace with '_'
-    # Magic: [ \:*?"'<>| ]
-    name = re.sub(r'[\\\:\*\?"\'<>\| ]', '_', name)
+def _cleanseFilename(name):
+    """
+    Get rid of 'magic' characters from potential filename - replace with '_'
+    Magic: [ \:*?"'<>| ]
+    """
+    return re.sub(r'[\\\:\*\?"\'<>\| ]', '_', name)
+
+def _processFilename(opts, name, dirs):
+    """
+    Handle directories, and files with the same name as directories
+    If name is foo/bar, and bar is in dirs (meaning there is a foo/bar/blech somewhere),
+    then we create the path foo/bar and the filename <git-root>/foo/bar/Index
+    """
+    name = _cleanseFilename(name)
+
+    # Some dir/filename collisions happen at top-level :(
+    if (name in dirs):
+        name = name + '/Index'
+
     if (string.find(name, '/') > -1):
         logging.debug('DIR FOUND [%s]' % name)
         # Treat as dir/dir/dir/basename
-        dirpath = string.replace(os.path.dirname(name), '/', 'd/')
-        d = '%s/%sd' % (opts.git_root_dir, dirpath)
+        d = opts.git_root_dir + '/' + os.path.dirname(name)
         f = os.path.basename(name)
-        logging.debug('...DIR/NAME [%s]/[%s]' % (d, f))
+        if (f in dirs):
+            #logging.debug('...FILENAME IS A DIR! [' + f + ']')
+            d = d + '/' + f
+            f = 'Index'
+        # logging.debug('...DIR/NAME [%s]/[%s]' % (d, f))
         if (not os.path.exists(d)):
             os.makedirs(d)
         return '%s/%s' % (d, f)
@@ -209,21 +221,53 @@ def _processFilename(opts, name):
 def _skipFile(fname):
     return (fname.startswith('Trac') or (fname.startswith('Wiki') and not fname.startswith('WikiStart')))
 
-def processWiki(opts, authors):
-    os.chdir(opts.git_root_dir)
-    logging.info('Processing the wiki...')
-    conn = sqlite3.connect(opts.trac_export)
+def _connect(opt):
+    conn = sqlite3.connect(opt.trac_export)
     conn.row_factory = sqlite3.Row
+    return conn
+
+def createFilenameMapping(opt):
+    logging.info('Creating filename-mapping...')
+    alldirs = set()
+    allfiles = {}
+    conn = _connect(opt)
+
+    # First find all directories
+    for row in conn.execute(MAXVERSION_SQL):
+        name = _cleanseFilename(row['name'])
+        if (string.find(name, '/') > -1):
+            dirs = os.path.dirname(name).split('/')
+            alldirs |= set(dirs)
+
+    import pprint
+    logging.debug('...created alldirs [%s]' % pprint.pformat(alldirs))
+
+    # Now, create a dict of (tracname: possibly-renamed-but-definitely-fqdn)
+    for row in conn.execute(MAXVERSION_SQL):
+        name = _processFilename(opt, row['name'], alldirs)
+        allfiles[row['name']] = name
+
+    conn.close()
+
+    logging.debug('...returning dict [%s]' % pprint.pformat(allfiles))
+    return allfiles
+
+def processWiki(opts, authors, allfiles):
+    logging.info('Processing the wiki...')
+    os.chdir(opts.git_root_dir)
+    conn = _connect(opts)
 
     # For every version of every file in the wiki...
     for row in conn.execute(ALLVERSIONS_SQL):
-        comment  = row['comment'] if row['comment'] else 'Initial load of version %s of trac-file %s' % (row['version'], row['name'])
-
         if (_skipFile(row['name'])):
             continue
 
-        fname = _processFilename(opts, row['name'])
+        comment  = row['comment'] if row['comment'] else 'Initial load of version %s of trac-file %s' % (row['version'], row['name'])
+
+        fname = allfiles[row['name']]
         logging.debug('...working with file [%s]' % fname)
+        logging.debug('tracname|fname : %s|%s' % (row['name'], fname))
+
         # Create file with content
         with open(fname, 'w') as f:
             f.truncate()
@@ -295,26 +339,23 @@ def _convert(text):
     text = '\n'.join(a)
     return text
 
-def toMarkdown(opts):
+def toMarkdown(opts, allfiles):
     """
     Convert Trac-markup in most-recent version of files, to Markdown markup
+    We're going to do ONE commit that renames All The Tings to *.md
+    Then we convert, then do ONE COMMIT that commits all the markup-conversion changes
     """
+
     logging.info('Converting to markdown...')
-    conn = sqlite3.connect(opts.trac_export)
-    conn.row_factory = sqlite3.Row
     os.chdir(opts.git_root_dir)
 
-    #
-    # We're going to do ONE commit that renames ALl The THings to *.md
-    # Then we convert, then do ONE COMMIT that commits all the markup-conversion changes
-    #
-
+    conn = _connect(opts)
     # For every every file in the wiki, get the max-version, rename to *.md
     for row in conn.execute(MAXVERSION_SQL):
         if (_skipFile(row['name'])):
             continue
 
-        fname = _processFilename(opts, row['name'])
+        fname = allfiles[row['name']]
         fname_md = fname + '.md'
 
         # git-mv the file to give it the .md extension
@@ -337,7 +378,7 @@ def toMarkdown(opts):
         # Get converted content
         content = _convert(row['text'])
 
-        fname = _processFilename(opts, row['name'])
+        fname = allfiles[row['name']]
         fname_md = fname + '.md'
 
         # Write the new contents
@@ -360,7 +401,7 @@ def toMarkdown(opts):
     conn.close()
     return 0
 
-def processAttachments(opts, authors):
+def processAttachments(opts, authors, alldirs):
     return 0
 
 def cleanup(opt):
@@ -380,6 +421,7 @@ if __name__ == '__main__':
         sys.exit(0)
 
     authMap = loadAuthorMap(options)
-    processWiki(options, authMap)
-    toMarkdown(options)
-    processAttachments(options, authMap)
+    fileMap = createFilenameMapping(options)
+    processWiki(options, authMap, fileMap)
+    toMarkdown(options, fileMap)
+    processAttachments(options, authMap, fileMap)
