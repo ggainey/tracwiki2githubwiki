@@ -58,20 +58,33 @@ select distinct author
  order by author
 '''
 
+GETATTACHMENTS_SQL = '''
+select id, filename
+  from attachment
+ where type = 'wiki'
+ order by id, filename
+'''
+
 MOVE_COMMENT    = "Renaming all files to have .md extension"
 CONVERT_COMMENT = "Converted to Markdown by tracwiki2githubwiki"
+
+# Stored content of --trac-base param
+trac_base = ''
 
 def setupOptions():
     usage = 'usage: %prog [options]'
     parser = OptionParser(usage=usage)
 
     locGroup = OptionGroup(parser, "Locations", "Where is your git-root and your trac export?")
-    locGroup.add_option('--git-root', action='store', dest='git_root_dir',
-                        metavar='/GIT/ROOT/DIR',
-                        help='Specify the full path to the root of the git-repository that is our destination')
+    locGroup.add_option('--trac-base', action='store', dest='trac_base',
+                        metavar='http://<source-trac>',
+                        help='Specify the path to the Trac that is our source. Example: http://fedorahosted.org/spacewalk')
     locGroup.add_option('--trac-export', action='store', dest='trac_export',
                         metavar='/PATH/TO/EXPORTFILE',
                         help='Specify the full path of the Trac sqlite3 database export file')
+    locGroup.add_option('--git-root', action='store', dest='git_root_dir',
+                        metavar='/GIT/ROOT/DIR',
+                        help='Specify the full path to the root of the git-repository that is our destination')
     parser.add_option_group(locGroup)
 
     authGroup = OptionGroup(parser, "Authors", "Where can we find information about authors?")
@@ -82,6 +95,12 @@ def setupOptions():
                          action='store_true', dest='extract_authors', default=False,
                          help='Write a list of Trac contributors to stdout, to be used to build the --author-map')
     parser.add_option_group(authGroup)
+
+    attachGroup = OptionGroup(parser, "Attachments", "Where can we find information about Trac attachments?")
+    attachGroup.add_option('--extract-trac-attachments',
+                         action='store_true', dest='extract_attachments', default=False,
+                         help='Write a list of full URLs for all Trac attachments to stdout')
+    parser.add_option_group(attachGroup)
 
     defaultGroup = OptionGroup(parser, "Defaults", "What do we use if Trac doesn't have info we need?")
     defaultGroup.add_option('--default-comment', action='store', dest='default_comment',
@@ -122,7 +141,11 @@ def verifyOptions(opt):
         logging.error('No trac-export specified - exiting...')
         sys.exit(1)
 
-    if (options.extract_authors):
+    if (not options.trac_base):
+        logging.error('no trac-base-url specified - exiting...')
+        sys.exit(1)
+
+    if (options.extract_authors or options.extract_attachments):
         return 0
 
     if (options.git_root_dir is None):
@@ -141,7 +164,7 @@ def verifyLocations(opt):
         logging.error('Cannot find trac-export %s!' % opt.trac_export)
 
     # git-root exists?
-    if (not options.extract_authors and not os.path.isdir(opt.git_root_dir)):
+    if (not (options.extract_authors or options.extract_attachments) and not os.path.isdir(opt.git_root_dir)):
         fail = True
         logging.error('Cannot find git-root-dir %s!' % opt.git_root_dir)
 
@@ -161,6 +184,16 @@ def generateTracAuthors(opt):
     conn = _connect(opt)
     for row in conn.execute(GETAUTHOR_SQL):
         print row['author']
+    conn.close()
+
+    return 0
+
+def extractTracAttachmentUrls(opt):
+    logging.info('Extracting Trac attachment URLs...')
+
+    conn = _connect(opt)
+    for row in conn.execute(GETATTACHMENTS_SQL):
+        print ('%s/raw-attachment/wiki/%s/%s') % (opt.trac_base, row['id'], row['filename'])
     conn.close()
 
     return 0
@@ -241,6 +274,33 @@ def processWiki(opts, authors):
     conn.close()
     return 0
 
+def sub_image_link(m):
+    """
+    <not-a-trac-image-url>
+    <trac-root>/attachment/wiki/<path>/<imagefilename>
+    <trac-root>/attachment/wiki/<path>/<imagefilename>?[odd-params-wtf]
+    <imagefilename>.<ext>
+    <wiki:<wiki-path-name>:imagefilename
+    <imagefilename>.<ext> align= link= nolink <key>=
+
+    Return <not-a-trac-image-url> OR images/<imagefilename>?raw=True
+    NOTE: assumes all images are in images/ at wiki-root.
+    ALSO: raw=True is a magic-gitub-ism, you MUST use it or The Magic Goes Worng...
+    """
+    link = m.group(1)
+    if (trac_base in link):
+        # We're pointing to old-loc - assume we really just want the image
+        # https://fedorahosted.org/spacewalk/attachment/wiki/ReleaseNotes25/spacewalk_25.png?format=raw
+        return '![Alt](images/%s?raw=True)' % link.split(' ')[0].split('://')[-1].split('/')[-1].split('?')[0]
+    elif (link.startswith('http')):
+        # Not trac-base but starts w/http - try to just use it
+        # Lose any optional arguments (post-\s), keep anything else
+        return '![Alt](%s)' % link.split(' ')[0]
+    else:
+        # Must be an internal Trac link - fun!
+        # Worst case: "a:b:c:d.jpg?raw=true align=right nolink border=1"
+        return '![Alt](images/%s?raw=True)' % link.split(' ')[0].split(':')[-1].split('?')[0]
+
 def _convert_wiki_link(link):
     """
     <tracname>
@@ -295,6 +355,8 @@ def _convert(text):
     """
     Conversion rules taken from https://gist.github.com/sgk/1286682, as modified by several
     other clones thereof
+
+    NOTE: ORDER MATTERS
     """
     # Fix 'Windows EOL' to 'Linux EOL'
     text = re.sub('\r\n', '\n', text)
@@ -354,6 +416,8 @@ def _convert(text):
             line = re.sub(r'\'\'(.*?)\'\'', r'_\1_', line)
             # Fix the LEAVE-ME-ALONE special sequence to [
             line = line.replace('}]}', '[')
+            # Fix [[Image()]] links to point to the right place w/the right markup
+            line = re.sub(r'\[\[\Image\((.*?)\)\]\]', sub_image_link, line)
         a.append(line)
     text = '\n'.join(a)
     return text
@@ -448,7 +512,11 @@ if __name__ == '__main__':
     if (options.extract_authors):
         generateTracAuthors(options)
         sys.exit(0)
+    elif (options.extract_attachments):
+        extractTracAttachmentUrls(options)
+        sys.exit(0)
 
+    trac_base = options.trac_base
     authMap = loadAuthorMap(options)
     processWiki(options, authMap)
     renameCurrent(options)
