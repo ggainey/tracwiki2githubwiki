@@ -61,11 +61,6 @@ select distinct author
 MOVE_COMMENT    = "Renaming all files to have .md extension"
 CONVERT_COMMENT = "Converted to Markdown by tracwiki2githubwiki"
 
-# Map of <tracname>: fsname - used in many places
-allfiles = {}
-alldirs = set()
-
-
 def setupOptions():
     usage = 'usage: %prog [options]'
     parser = OptionParser(usage=usage)
@@ -197,38 +192,9 @@ def loadAuthorMap(opt):
 def _cleanseFilename(name):
     """
     Get rid of 'magic' characters from potential filename - replace with '_'
-    Magic: [ \:*?"'<>| ]
+    Magic: [ /\:*?"'<>| ]
     """
-    return re.sub(r'[\\\:\*\?"\'<>\| ]', '_', name)
-
-def _processFilename(opts, name, dirs):
-    """
-    Handle directories, and files with the same name as directories
-    If name is foo/bar, and bar is in dirs (meaning there is a foo/bar/blech somewhere),
-    then we create the path foo/bar and the filename foo/bar/Index
-    """
-    name = _cleanseFilename(name)
-
-    # Some dir/filename collisions happen at top-level :(
-    if (name in dirs):
-        name = name + '/Index'
-
-    if (string.find(name, '/') > -1):
-        #logging.debug('DIR FOUND [%s]' % name)
-        # Treat as dir/dir/dir/basename
-        d = os.path.dirname(name)
-        f = os.path.basename(name)
-        if (f in dirs):
-            #logging.debug('...FILENAME IS A DIR! [' + f + ']')
-            d = d + '/' + f
-            f = 'Index'
-        #logging.debug('...DIR/NAME [%s]/[%s]' % (d, f))
-        # We're about to work with the FILESYSTEM - don't forget git-root!
-        if (not os.path.exists(opts.git_root_dir + '/' + d)):
-            os.makedirs(opts.git_root_dir + '/' + d)
-        return '%s/%s' % (d, f)
-    else:
-        return name
+    return re.sub(r'[\/\\\:\*\?"\'<>\| ]', '_', name)
 
 def _skipFile(fname):
     return (fname.startswith('Trac') or (fname.startswith('Wiki') and not fname.startswith('WikiStart')))
@@ -237,30 +203,6 @@ def _connect(opt):
     conn = sqlite3.connect(opt.trac_export)
     conn.row_factory = sqlite3.Row
     return conn
-
-def createFilenameMapping(opt):
-    alldirs = set()
-    logging.info('Creating filename-mapping...')
-    conn = _connect(opt)
-
-    # First find all directories
-    for row in conn.execute(MAXVERSION_SQL):
-        name = _cleanseFilename(row['name'])
-        if (string.find(name, '/') > -1):
-            dirs = os.path.dirname(name).split('/')
-            alldirs |= set(dirs)
-
-    import pprint
-    logging.debug('...created alldirs [%s]' % pprint.pformat(alldirs))
-
-    # Now, create a dict of (tracname: possibly-renamed-but-definitely-fqdn)
-    for row in conn.execute(MAXVERSION_SQL):
-        name = _processFilename(opt, row['name'], alldirs)
-        allfiles[_cleanseFilename(row['name'])] = name
-
-    conn.close()
-
-    logging.debug('...created dict [%s]' % pprint.pformat(allfiles))
 
 def processWiki(opts, authors):
     logging.info('Processing the wiki...')
@@ -274,7 +216,7 @@ def processWiki(opts, authors):
 
         comment  = row['comment'] if row['comment'] else 'Initial load of version %s of trac-file %s' % (row['version'], row['name'])
 
-        fname = opts.git_root_dir + '/' + allfiles[_cleanseFilename(row['name'])]
+        fname = opts.git_root_dir + '/' + _cleanseFilename(row['name'])
         logging.debug('...working with file [%s]' % fname)
         #logging.debug('tracname|fname : %s|%s' % (row['name'], fname))
 
@@ -319,16 +261,6 @@ def _convert_wiki_link(link):
             link = link[:lasthash]
         # Cleanse the result
         link = _cleanseFilename(link)
-        # See if what's left might now be recognized as a directory
-        if (os.path.basename(link) in alldirs):
-            link += '/Index'
-
-    #logging.debug('..._convert_wiki_link about to look for [' + link + ']')
-
-    # Final result might *still* not be in allfiles (because broken links are a thing...)
-    if (link in allfiles):
-        return allfiles[link]
-    else:
         return link
 
 # Fixing Trac links is fun, esp when you're doing multiple passes.
@@ -440,7 +372,7 @@ def renameCurrent(opts):
         if (_skipFile(row['name'])):
             continue
 
-        fname = opts.git_root_dir + '/' + allfiles[_cleanseFilename(row['name'])]
+        fname = opts.git_root_dir + '/' + _cleanseFilename(row['name'])
         fname_md = fname + '.md'
 
         # git-mv the file to give it the .md extension
@@ -476,7 +408,7 @@ def toMarkdown(opts):
         # CONVERT THE CONTENT
         content = _convert(row['text'])
 
-        fname = opts.git_root_dir + '/' + allfiles[_cleanseFilename(row['name'])]
+        fname = opts.git_root_dir + '/' + _cleanseFilename(row['name'])
         fname_md = fname + '.md'
         # Write the new contents
         logging.debug('...writing converted file [%s]' % fname_md)
@@ -518,7 +450,6 @@ if __name__ == '__main__':
         sys.exit(0)
 
     authMap = loadAuthorMap(options)
-    createFilenameMapping(options)
     processWiki(options, authMap)
     renameCurrent(options)
     toMarkdown(options)
