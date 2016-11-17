@@ -401,7 +401,7 @@ def _convert(text):
     # Fix numbered lists
     text = re.sub(r'^ \d+. ', r'1.', text)
     # Fix hard-BR
-    text = re.sub(r'(?m)\[\[BR\]\]$', '  ', text)
+    text = re.sub(r'(?m)\[\[BR\]\]$', '\n', text)
     a = []
     for line in text.split('\n'):
         # Ignore blockquote lines
