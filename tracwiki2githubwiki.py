@@ -65,6 +65,7 @@ CONVERT_COMMENT = "Converted to Markdown by tracwiki2githubwiki"
 allfiles = {}
 alldirs = set()
 
+
 def setupOptions():
     usage = 'usage: %prog [options]'
     parser = OptionParser(usage=usage)
@@ -204,7 +205,7 @@ def _processFilename(opts, name, dirs):
     """
     Handle directories, and files with the same name as directories
     If name is foo/bar, and bar is in dirs (meaning there is a foo/bar/blech somewhere),
-    then we create the path foo/bar and the filename <git-root>/foo/bar/Index
+    then we create the path foo/bar and the filename foo/bar/Index
     """
     name = _cleanseFilename(name)
 
@@ -215,18 +216,19 @@ def _processFilename(opts, name, dirs):
     if (string.find(name, '/') > -1):
         #logging.debug('DIR FOUND [%s]' % name)
         # Treat as dir/dir/dir/basename
-        d = opts.git_root_dir + '/' + os.path.dirname(name)
+        d = os.path.dirname(name)
         f = os.path.basename(name)
         if (f in dirs):
             #logging.debug('...FILENAME IS A DIR! [' + f + ']')
             d = d + '/' + f
             f = 'Index'
-        # logging.debug('...DIR/NAME [%s]/[%s]' % (d, f))
-        if (not os.path.exists(d)):
-            os.makedirs(d)
+        #logging.debug('...DIR/NAME [%s]/[%s]' % (d, f))
+        # We're about to work with the FILESYSTEM - don't forget git-root!
+        if (not os.path.exists(opts.git_root_dir + '/' + d)):
+            os.makedirs(opts.git_root_dir + '/' + d)
         return '%s/%s' % (d, f)
     else:
-        return '%s/%s' % (opts.git_root_dir, name)
+        return name
 
 def _skipFile(fname):
     return (fname.startswith('Trac') or (fname.startswith('Wiki') and not fname.startswith('WikiStart')))
@@ -272,7 +274,7 @@ def processWiki(opts, authors):
 
         comment  = row['comment'] if row['comment'] else 'Initial load of version %s of trac-file %s' % (row['version'], row['name'])
 
-        fname = allfiles[_cleanseFilename(row['name'])]
+        fname = opts.git_root_dir + '/' + allfiles[_cleanseFilename(row['name'])]
         logging.debug('...working with file [%s]' % fname)
         #logging.debug('tracname|fname : %s|%s' % (row['name'], fname))
 
@@ -303,43 +305,59 @@ def _convert_wiki_link(link):
     <tracname>#anchor
     wiki:<tracname> or just <tracname>
     wiki:<tracname>#anchor
+    http<s>://foobarblech?pi=1&p3=4
     """
-    logging.debug('..._convert_wiki_link [' + link + ']')
-    # drop leading wiki:
-    if link.startswith('wiki:'):
-        link = link[5:]
-    # find and drop any anchors
-    lasthash = string.rfind(link, '#')
-    if (lasthash > -1):
-        link = link[:lasthash]
-    # Cleanse the result
-    link = _cleanseFilename(link)
+    #logging.debug('..._convert_wiki_link [' + link + ']')
+    if (link.startswith('http')):
+        return link
+    else:
+        # drop leading wiki:
+        link = link[5:] if link.startswith('wiki:') else link
+        # find and drop any anchors
+        lasthash = string.rfind(link, '#')
+        if (lasthash > -1):
+            link = link[:lasthash]
+        # Cleanse the result
+        link = _cleanseFilename(link)
+        # See if what's left might now be recognized as a directory
+        if (os.path.basename(link) in alldirs):
+            link += '/Index'
 
-    # See if what's left might now be recognized as a directory
-    if (os.path.basename(link) in alldirs):
-        link += '/Index'
+    #logging.debug('..._convert_wiki_link about to look for [' + link + ']')
 
     # Final result might *still* not be in allfiles (because broken links are a thing...)
     if (link in allfiles):
-        return allfiles[link] + '.md'
+        return allfiles[link]
     else:
-        return link + '.md'
+        return link
 
+# Fixing Trac links is fun, esp when you're doing multiple passes.
+# [ThisIsMyLink And its description] wants to become (And its description)[ThisIsMyLink]
+# Unfortunately, that leaves [ThisIsMyLink] looking like a 'simple Trac link' that can be
+# picked up by further REs. Fun.
+# We will use '}}' in place of '[', so we stop trying to 'fix' it, and then globally replace
+# it at the end of processing.
 def sub_full_wiki_link(m):
-    return '[%s](%s)' % (m.group(2), _convert_wiki_link(m.group(1)))
+    #logging.debug('...sub_full,[%s](%s)' % (m.group(2), m.group(1)))
+    return '}]}%s](%s)' % (m.group(2), _convert_wiki_link(m.group(1)))
 
 def sub_simple_wiki_link(m):
-    return '[[%s]]' % _convert_wiki_link(m.group(1))
+    #logging.debug('...sub_simple, [[%s]]' % m.group(1))
+    return '}]}[%s]]' % _convert_wiki_link(m.group(1))
 
-def sub_table(m):
-    import pprint
-    logging.debug('..._sub_table [%s]' % pprint.pformat(m))
-    lines = []
-    for group in m.group(0).strip().split('\n'):
-        lines.append(' | '.join(group.strip().split('||')).strip())
-        width = len(m.group(1).strip().split('||')) - 2
-        lines.insert(1, '| %s |' % ' | '.join('---' for x in range(width)))
-    return '\n%s\n' % '\n'.join(lines)
+def _looks_like_blockquote(line):
+    """
+    4 starting blanks is a blockquote - except when it starts a line
+    that is a header or part of a bullet-list (?!?)
+    """
+    if (line.startswith('    ')):
+        line = line.strip()
+        if (not line):
+            return True
+        leadchar = line[0] # Check lead non-whitespace char
+        return False if (leadchar == '*' or leadchar == '=') else True
+    else:
+        return False
 
 def _convert(text):
     """
@@ -350,25 +368,24 @@ def _convert(text):
     text = re.sub('\r\n', '\n', text)
     # Fix code-format-inline
     text = re.sub(r'{{{(.*?)}}}', r'`\1`', text)
-
+    # Fix fenced-block
     def indent4(m):
         return '\n    ' + m.group(1).replace('\n', '\n    ')
     # Fix code-format-block
     text = re.sub(r'(?sm){{{\n(.*?)\n}}}', indent4, text)
-    # Fix tables
-    text = re.sub(r'(?m)^(\|\|[^\n]+\|\| *\n?)+$', sub_table, text)
-    # Fix [[TOC]]
-    text = re.sub(r'\[\[TOC.*\]\]', r'<!--[[TOC]]-->', text)
-    # Fix [[PageOutline]]
-    text = re.sub(r'\[\[PageOutline\]\]', r'<!--[[PageOutline]]-->', text)
+    # Remove [[TOC]]
+    text = re.sub(r'\[\[TOC.*\]\]', r'', text)
+    # Remove [[PageOutline]]
+    text = re.sub(r'\[\[PageOutline\]\]', r'', text)
+    # Headers (note: can look like '== Foo == #fooanchor and stuff' in Trac)
     # Fix Header-4
-    text = re.sub(r'(?m)^====\s+(.*?)\s+====\s*$', r'#### \1', text)
+    text = re.sub(r'(?m)^\s*====\s+(.*?)\s+====([\s#].*)$', r'#### \1\n\2\n', text)
     # Fix Header-3
-    text = re.sub(r'(?m)^===\s+(.*?)\s+===\s*$', r'### \1', text)
+    text = re.sub(r'(?m)^\s*===\s+(.*?)\s+===([\s#].*)$', r'### \1\n\2\n', text)
     # Fix Header-2
-    text = re.sub(r'(?m)^==\s+(.*?)\s+==\s*$', r'## \1', text)
+    text = re.sub(r'(?m)^\s*==\s+(.*?)\s+==([\s#].*)$', r'## \1\n\2\n', text)
     # Fix Header-1
-    text = re.sub(r'(?m)^=\s+(.*?)\s+=\s*$', r'# \1', text)
+    text = re.sub(r'(?m)^\s*=\s+(.*?)\s+=([\s#].*)$', r'# \1\n\2\n', text)
     # Fix 4th-level-bullet-lists
     text = re.sub(r'^        * ', r'****', text)
     text = re.sub(r'^       * ', r'****', text)
@@ -387,34 +404,34 @@ def _convert(text):
     text = re.sub(r'(?m)\[\[BR\]\]$', '  ', text)
     a = []
     for line in text.split('\n'):
-        # Fix external hyperlinks
-        line = re.sub(r'\[(https?://[^\s\[\]]+)\s([^\[\]]+)\]', r'[\2](\1)', line)
-        # Fix simple-internal-wiki-links (?)
-        line = re.sub(r'(?<!\[)\[([^\s\[\]]+?)\]', sub_simple_wiki_link, line)
-        # Fix wiki-links that don't start with wiki: (?!?)
-        line = re.sub(r'\[([^\s\[\]]+)\s([^\[\]]+)\]', sub_full_wiki_link, line)
-        # Fix complex-internal-wiki-links
-        line = re.sub(r'\[wiki:([^\s\[\]\"]+)\s([^\[\]]+)\]', sub_full_wiki_link, line)
-        # Fix complex-internal-wiki-links WITH QUOTES
-        line = re.sub(r'\[wiki:"([^\[\]]+)"\s([^\[\]]+)\]', sub_full_wiki_link, line)
-        # Fix "don't auto-trac-link-this" links
-        line = re.sub(r'\!(([A-Z][a-z0-9]+){2,})', r'\1', line)
-        # Fix bold
-        line = re.sub(r'\'\'\'(.*?)\'\'\'', r'*\1*', line)
-        # Fix italics
-        line = re.sub(r'\'\'(.*?)\'\'', r'_\1_', line)
+        # Ignore blockquote lines
+        if (not _looks_like_blockquote(line)):
+            # Fix simple-internal-wiki-links (?)
+            line = re.sub(r'(?<!\[)\[([^\s\[\]]+?)\]', sub_simple_wiki_link, line)
+            # Fix complex-internal-wiki-links
+            line = re.sub(r'\[wiki:([^\s\[\]\"]+)\s([^\[\]]+)\]', sub_full_wiki_link, line)
+            # Fix complex-internal-wiki-links WITH QUOTES
+            line = re.sub(r'\[wiki:"([^\[\]]+)"\s([^\[\]]+)\]', sub_full_wiki_link, line)
+            # Fix wiki-links that don't start with wiki:
+            line = re.sub(r'\[([^\s\[\]]+)\s([^\[\]]+)\]', sub_full_wiki_link, line)
+            # Fix "don't auto-trac-link-this" links
+            line = re.sub(r'\!(([A-Z][a-z0-9]+){2,})', r'\1', line)
+            # Fix bold
+            line = re.sub(r'\'\'\'(.*?)\'\'\'', r'*\1*', line)
+            # Fix italics
+            line = re.sub(r'\'\'(.*?)\'\'', r'_\1_', line)
+            # Fix the LEAVE-ME-ALONE special sequence to [
+            line = line.replace('}]}', '[')
         a.append(line)
     text = '\n'.join(a)
     return text
 
-def toMarkdown(opts):
+def renameCurrent(opts):
     """
-    Convert Trac-markup in most-recent version of files, to Markdown markup
-    We're going to do ONE commit that renames All The Tings to *.md
-    Then we convert, then do ONE COMMIT that commits all the markup-conversion changes
+    We're going to do ONE commit that renames All The Things to *.md
     """
 
-    logging.info('Converting to markdown...')
+    logging.info('Renaming all to *.md...')
     os.chdir(opts.git_root_dir)
 
     conn = _connect(opts)
@@ -423,7 +440,7 @@ def toMarkdown(opts):
         if (_skipFile(row['name'])):
             continue
 
-        fname = allfiles[_cleanseFilename(row['name'])]
+        fname = opts.git_root_dir + '/' + allfiles[_cleanseFilename(row['name'])]
         fname_md = fname + '.md'
 
         # git-mv the file to give it the .md extension
@@ -437,20 +454,32 @@ def toMarkdown(opts):
     if (rc):
         logging.error('ERROR [%d] at MOVE git-commit!!!' % rc)
 
+    conn.close()
+    return rc
+
+def toMarkdown(opts):
+    """
+    Convert Trac-markup in most-recent version of files, which have been renamed to *.md,
+    to Markdown markup
+    We do ONE COMMIT that commits all the markup-conversion changes
+    """
+    logging.info('Converting to markdown...')
+    os.chdir(opts.git_root_dir)
+
+    conn = _connect(opts)
     # For every every file in the wiki, get the max-version, convert that text to
     # markdown, and save it as a new version of that file
     for row in conn.execute(MAXVERSION_SQL):
         if (_skipFile(row['name'])):
             continue
 
-        # Get converted content
+        # CONVERT THE CONTENT
         content = _convert(row['text'])
 
-        fname = allfiles[_cleanseFilename(row['name'])]
+        fname = opts.git_root_dir + '/' + allfiles[_cleanseFilename(row['name'])]
         fname_md = fname + '.md'
-
         # Write the new contents
-        logging.debug('...working with file [%s]' % fname_md)
+        logging.debug('...writing converted file [%s]' % fname_md)
         with open(fname_md, 'w') as f:
             f.truncate()
             f.write(content.encode('utf-8'))
@@ -467,7 +496,7 @@ def toMarkdown(opts):
         logging.error('ERROR [%d] at git-commit %s!!!' % (rc, fname))
 
     conn.close()
-    return 0
+    return rc
 
 def processAttachments(opts, authors):
     return 0
@@ -491,5 +520,6 @@ if __name__ == '__main__':
     authMap = loadAuthorMap(options)
     createFilenameMapping(options)
     processWiki(options, authMap)
+    renameCurrent(options)
     toMarkdown(options)
     processAttachments(options, authMap)
