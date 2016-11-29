@@ -141,11 +141,14 @@ def verifyOptions(opt):
         logging.error('No trac-export specified - exiting...')
         sys.exit(1)
 
+    if (options.extract_authors):
+        return 0
+
     if (not options.trac_base):
         logging.error('no trac-base-url specified - exiting...')
         sys.exit(1)
 
-    if (options.extract_authors or options.extract_attachments):
+    if (options.extract_attachments):
         return 0
 
     if (options.git_root_dir is None):
