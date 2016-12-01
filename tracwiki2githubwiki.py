@@ -277,6 +277,14 @@ def processWiki(opts, authors):
     conn.close()
     return 0
 
+def sub_table(m):
+    lines = []
+    for group in m.group(0).strip().split('\n'):
+        lines.append(' | '.join(group.strip().split('||')).strip())
+    width = len(m.group(1).strip().split('||')) - 2
+    lines.insert(1, '| %s |' % ' | '.join('---' for x in range(width)))
+    return '\n%s\n' % '\n'.join(lines)
+
 def sub_image_link(m):
     """
     <not-a-trac-image-url>
@@ -285,6 +293,7 @@ def sub_image_link(m):
     <imagefilename>.<ext>
     <wiki:<wiki-path-name>:imagefilename
     <imagefilename>.<ext> align= link= nolink <key>=
+    <imagefilename>.<ext>, align= link= nolink <key>=
 
     Return <not-a-trac-image-url> OR images/<imagefilename>?raw=True
     NOTE: assumes all images are in images/ at wiki-root.
@@ -302,7 +311,8 @@ def sub_image_link(m):
     else:
         # Must be an internal Trac link - fun!
         # Worst case: "a:b:c:d.jpg?raw=true align=right nolink border=1"
-        return '![Alt](images/%s?raw=True)' % link.split(' ')[0].split(':')[-1].split('?')[0]
+        # Next-worse: "a:b:c:d.jpg, foobarblech"
+        return '![Alt](images/%s?raw=True)' % re.split('[\s,]', link.split(' ')[0].split(':')[-1])[0].split('?')[0]
 
 def _convert_wiki_link(link):
     """
@@ -363,6 +373,13 @@ def _convert(text):
     """
     # Fix 'Windows EOL' to 'Linux EOL'
     text = re.sub('\r\n', '\n', text)
+    # Fix tables
+    #   (FAILS on tables where the last row-entry is not ended by '||', which Trac is mostly
+    #    OK with - so find and fix that first, if we can)
+    text = re.sub(r'(?m)^(\ *\|\|[^\n]+\|\|\ *[^\s]+$)+$', r'\1||', text)
+    # Now Markdown-table-ify
+    # (Still FAILS on tables that are not followed by an empty line, alas)
+    text = re.sub(r'(?m)^(\ *\|\|[^\n]+\|\|\ *\n)+$', sub_table, text)
     # Fix code-format-inline
     text = re.sub(r'{{{(.*?)}}}', r'`\1`', text)
     # Fix fenced-block
@@ -399,6 +416,7 @@ def _convert(text):
     text = re.sub(r'^ \d+. ', r'1.', text)
     # Fix hard-BR
     text = re.sub(r'(?m)\[\[BR\]\]$', '\n', text)
+
     a = []
     for line in text.split('\n'):
         # Ignore blockquote lines
