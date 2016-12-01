@@ -38,3 +38,14 @@ With this information, it will:
  * specfile
  * make everything more Python-y
  * Py3?
+
+## ATTRIBUTIONS
+
+The _convert() code is based on [SGK's Gist](https://gist.github.com/sgk/1286682), as
+informed by modifications made in the following clones:
+
+ * [gazpachpking](https://gist.github.com/gazpachoking/9540849)
+ * [andreas-fatal](https://gist.github.com/andreas-fatal/739e1ddf4207a0e5e3c8)
+ * [pommi](https://gist.github.com/pommi/fb0858abecaad4b245d6)
+
+
