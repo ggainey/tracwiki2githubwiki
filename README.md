@@ -7,15 +7,16 @@ It requires:
  * A sqlite3 export from the existing Trac instance
  * The 'root name' for said Trac (e.g., `http://fedorahosted.org/spacewalk`)
  * A local git-repository
- * An images/ directory in said repo, full of images extracted from Trac
- * An (optional) author-mapping.csv, of trac-author,"Git Author <gitauthor@email.adr>" format
+
+To use it effectively, one should:
+
+ * Use --extract-trac-authors to extract Trac authors
+  * USER: turn into a CSV of "trac-author,github-first github-last <login@email>" format, preserving matching github authors as we can, and submit to --author-map
+ * Use --extract-trac-attachments to get the URLs of every Trac attachment
+  * USER: wget all into images/ in the root wiki directory so we can find them later
 
 With this information, it will:
 
- * Use --extract-trac-authors to extract Trac authors
-  * USER: Fill in matching github authors as we can, submit to --author-map
- * Use --extract-trac-attachments to get the URLs of every Trac attachment
-  * USER: wget all into images/ in the root wiki directory so we can find them later
  * Extract every version from trac.wiki:
   * Convert special characters in the 'name' field to '_'
   * git add that file
@@ -25,19 +26,20 @@ With this information, it will:
 
 ## What does it convert?
 
- * Headers
- * Lists
  * Blockquotes
- * Fenced content
+ * Fenced ("code formatted") content
+ * "code formatted" inlines
+ * Headers
  * Image links
+ * Lists
+ * Tables
 
 ## TO-DOs
 
- * tables? (ew)
  * manpage
  * specfile
  * make everything more Python-y
- * Py3?
+ * Py3 please
 
 ## ATTRIBUTIONS
 
